@@ -1,234 +1,166 @@
-getspf () {
-	FILE_POSTSCREEN='/etc/postfix/maps/postscreen_spf_whitelist.cidr' 
-	FILE_CRON='/etc/crontab' 
-	FILE_SCRIPT='/root/getspf.sh' 
-	DOMAIN_DEFAULT='microsoft.com google.com' 
-	if [[ "$OSTYPE" == "darwin*" ]]
-	then
-		WHICHCMD="which" 
-	else
-		WHICHCMD="typeset -f" 
-	fi
-	$WHICHCMD e_error &> /dev/null && ECHOCMD='e_error'  || ECHOCMD='echo' 
-	if ! which ipcalc &> /dev/null
-	then
-		$ECHOCMD "please install 'ipcalc'"
-		return 1
-	fi
-	if [[ "$OSTYPE" == "darwin*" ]]
-	then
-		if ! gawk &> /dev/null
-		then
-			$ECHOCMD "please install 'gawk'"
-			return 1
-		fi
-		CMD_AWK="gawk" 
-	else
-		CMD_AWK="awk" 
-	fi
-	SILENT=0 
-	POSTSCREEN=0 
-	reg_exp () {
-		echo "$2" | "$CMD_AWK" "{pattern=\"$1\"; while (match(\$0, pattern, arr)) {val = arr[1]; print val; sub(pattern, \"\")}}"
-	}
-	spf_domain () {
-		LIST_IP='' 
-		LIST_INCLUDE='' 
-		COUNT_DIG=0 
-		SPF_RECORD="$(dig +short +nodnssec TXT $1 | grep 'v=spf1' | sed 's/\" \"//g' | sed 's/\"//g' | awk '{for(i=1;i<=NF;i++){if ($i ~ /redirect=|ip4:|include:|a:/) {print $i}}}' | xargs)" 
-		while true
-		do
-			LIST_IP+=" $(reg_exp 'ip4:([^ ]+)' "$SPF_RECORD" | xargs)" 
-			LIST_IP+=" $(for DOMAIN_NAME in $(reg_exp 'a:([^ ]+)' "$SPF_RECORD" | xargs); do dig +short +nodnssec $DOMAIN_NAME; COUNT_DIG="$(expr $COUNT_DIG + 1)"; done)" 
-			DOMAIN_ADD="$(reg_exp 'include:([^ ]+)' "$SPF_RECORD" | xargs)" 
-			! [ -z "$DOMAIN_ADD" ] && LIST_INCLUDE+=" $DOMAIN_ADD" 
-			DOMAIN_ADD="$(reg_exp 'redirect=([^ ]+)' "$SPF_RECORD" | xargs)" 
-			! [ -z "$DOMAIN_ADD" ] && LIST_INCLUDE+=" $DOMAIN_ADD" 
-			if [ -z "$LIST_INCLUDE" ]
-			then
-				break
-			else
-				SPF_RECORD="$(dig +short +nodnssec TXT $(echo $LIST_INCLUDE | awk '{print $1}') | grep 'v=spf1' | sed 's/\" \"//g' | sed 's/\"//g' | awk '{for(i=1;i<=NF;i++){if ($i ~ /redirect=|ip4:|include:|a:/) {print $i}}}' | xargs)" 
-				COUNT_DIG="$(expr $COUNT_DIG + 1)" 
-				LIST_INCLUDE="$(echo $LIST_INCLUDE | awk '{for(i=2;i<=NF;i++) {print $i}}' | xargs)" 
-			fi
-		done
-		MX_IP="$(for MX_ADDRESS in $(dig +short +nodnssec mx $1 | awk '{print $2}'); do dig +short +nodnssec A $MX_ADDRESS; done)" 
-		! [ -z "$MX_IP" ] && LIST_IP+=" $MX_IP" 
-		LIST_IP="$(echo $LIST_IP | xargs -n 1 | sort -uV)" 
-		LIST_IP_VALID='' 
-		LIST_IP_INVALID='' 
-		for IP_ADDRESS in $(echo $LIST_IP)
-		do
-			if [ -z "$(echo $IP_ADDRESS | awk -F'.' 'NF==4 && $1>0 && $1<224 && $2>=0 && $2<256 && $3>=0 && $3<256 && $4>=0')" ]
-			then
-				LIST_IP_INVALID+=" $IP_ADDRESS" 
-			else
-				LIST_IP_VALID+=" $IP_ADDRESS" 
-			fi
-		done
-		LIST_CIDR_VALID='' 
-		LIST_CIDR_INVALID='' 
-		for IP_ADDRESS in $(echo $LIST_IP_VALID | xargs -n 1)
-		do
-			if echo $IP_ADDRESS | grep --color -q -v '/' || echo "$IP_ADDRESS" | grep --color -q '/32'
-			then
-				LIST_CIDR_VALID+=" $IP_ADDRESS" 
-			else
-				NETWORK=$(ipcalc "$IP_ADDRESS" | grep "^Network" | awk '{print $2}' | awk -F "/" '{print $1}') 
-				IP_ADDR=$(ipcalc "$IP_ADDRESS" | grep "^Address" | awk '{print $2}') 
-				[[ "$NETWORK" != "$IP_ADDR" ]] && LIST_CIDR_INVALID+=" $IP_ADDRESS"  || LIST_CIDR_VALID+=" $IP_ADDRESS" 
-			fi
-		done
-		if [ "$POSTSCREEN" = 1 ]
-		then
-			for IP_ADDRESS in $(echo $LIST_CIDR_VALID | xargs -n 1)
-			do
-				if [ "$SILENT" = 0 ]
-				then
-					echo "$IP_ADDRESS permit" >> $FILE_POSTSCREEN
-				else
-					echo "$IP_ADDRESS permit"
-				fi
-			done
-			[ "$SILENT" = 0 ] && echo "IPv4 addresses/domains added to Postscreen SPF whitelist '$FILE_POSTSCREEN'"
-		else
-			echo "$LIST_CIDR_VALID" | xargs -n 1
-		fi
-		if [ "$SILENT" = 0 ]
-		then
-			echo ''
-			if ! [ -z "$LIST_IP_INVALID" ]
-			then
-				for IP_ADDRESS in $(echo $LIST_IP_INVALID | xargs -n 1)
-				do
-					$ECHOCMD "$IP_ADDRESS is not a valid IPv4 address (maybe CNAME?)"
-				done
-			fi
-			if ! [ -z "$LIST_CIDR_INVALID" ]
-			then
-				for IP_ADDRESS in $(echo $LIST_CIDR_INVALID | xargs -n 1)
-				do
-					$ECHOCMD "IPv4 network $IP_ADDRESS should be $(ipcalc $IP_ADDRESS| grep "^Network:" | awk '{ print $2 }')"
-				done
-			fi
-			echo "IPv4 addresses/networks: $(echo $LIST_IP | wc -w)"
-			echo "DNS lookups: $COUNT_DIG"
-			[ "$COUNT_DIG" -gt 10 ] && $ECHOCMD "DNS lookups >10, SPF entry is invalid (RFC 4408)"
-		fi
-	}
-	ARG_QUERY='' 
-	ERROR_INPUT=0 
-	INSTALL=0 
-	for ARG in $@
-	do
-		if [ "$ARG" = '-s' ] || [ "$ARG" = '--silent' ]
-		then
-			SILENT=1 
-		elif [ "$ARG" = '-p' ] || [ "$ARG" = '--postscreen' ]
-		then
-			POSTSCREEN=1 
-		elif [ "$ARG" = '-i' ] || [ "$ARG" = '--install' ]
-		then
-			INSTALL=1 
-		elif [ "$ARG" = '-h' ] || [ "$ARG" = '-?' ] || [ "$ARG" = '--help' ]
-		then
-			echo "Usage: $(basename $0) [-s/--slient] [-p/--postscreen] [-i/--install] [-h/-?/--help] domain_name/file_with_domain_names"
-			return 0
-		else
-			[ -z "$ARG_QUERY" ] && ARG_QUERY="$ARG"  || ERROR_INPUT=1 
-		fi
-	done
-	if [ "$ERROR_INPUT" = 1 ]
-	then
-		echo "Usage: $(basename $0) [-s/--slient] [-p/--postscreen] [-i/--install] [-h/-?/--help] domain_name/file_with_domain_names"
-		return 1
-	fi
-	if [ "$POSTSCREEN" = 1 ]
-	then
-		mkdir -p "$(echo $FILE_POSTSCREEN | awk -F/ '{OFS="/"; $NF=""; print $0}')"
-		rm -i -f "$FILE_POSTSCREEN"
-	fi
-	if [ -z "$ARG_QUERY" ]
-	then
-		if [ "$SILENT" = 0 ]
-		then
-			for DOMAIN in $(echo $DOMAIN_DEFAULT | xargs -n 1)
-			do
-				echo "Domain: $DOMAIN"$'\n'
-				spf_domain "$DOMAIN"
-				echo "==================================================="
-			done
-			if [ "$POSTSCREEN" = 1 ]
-			then
-				LIST_RESULT="$(cat $FILE_POSTSCREEN)" 
-				echo "$LIST_RESULT" | xargs -n 2 | sort -uV > $FILE_POSTSCREEN
-			fi
-		else
-			LIST_RESULT="$(for DOMAIN in $(echo $DOMAIN_DEFAULT | xargs -n 1); do spf_domain "$DOMAIN"; done | sort -uV)" 
-			if [ "$POSTSCREEN" = 1 ]
-			then
-				echo "$LIST_RESULT" | xargs -n 2 >> $FILE_POSTSCREEN
-			else
-				echo "$LIST_RESULT" | xargs -n 1
-			fi
-		fi
-	elif [ -f "$ARG_QUERY" ]
-	then
-		if [ "$SILENT" = 0 ]
-		then
-			while read DOMAIN
-			do
-				if ! [ -z "$DOMAIN" ]
-				then
-					echo "Domain: $DOMAIN"$'\n'
-					spf_domain "$DOMAIN"
-					echo "==================================================="
-				fi
-			done < "$ARG_QUERY"
-			if [ "$POSTSCREEN" = 1 ]
-			then
-				LIST_RESULT="$(cat $FILE_POSTSCREEN)" 
-				echo "$LIST_RESULT" | xargs -n 2 | sort -uV > $FILE_POSTSCREEN
-			fi
-		else
-			LIST_RESULT="$(while read DOMAIN; do if ! [ -z "$DOMAIN" ]; then spf_domain "$DOMAIN"; fi; done < "$ARG_QUERY" | sort -uV)" 
-			if [ "$POSTSCREEN" = 1 ]
-			then
-				echo "$LIST_RESULT" | xargs -n 2 >> $FILE_POSTSCREEN
-			else
-				echo "$LIST_RESULT" | xargs -n 1
-			fi
-		fi
-	else
-		LIST_RESULT="$(spf_domain "$ARG_QUERY")" 
-		if [ "$POSTSCREEN" = 1 ]
-		then
-			echo "$LIST_RESULT" | xargs -n 2 >> $FILE_POSTSCREEN
-			[ "$SILENT" = 0 ] && echo "IPv4 addresses/domains added to Postscreen SPF whitelist '$FILE_POSTSCREEN'"
-		else
-			echo "$LIST_RESULT" | xargs -n 1
-		fi
-	fi
-	if [ "$INSTALL" = 1 ]
-	then
-		POSTFIX_INBOUND="$(postmulti -l | grep '^postfix-in' | awk '{print $1}')" 
-		[ -z "$POSTFIX_INBOUND" ] && CMD_POSTCONF='postconf'  || CMD_POSTCONF="postmulti -i "$POSTFIX_INBOUND" -x postconf" 
-		LIST_ACCESS="$($CMD_POSTCONF postscreen_access_list | awk -F ' = ' '{print $2}')" 
-		echo "$LIST_ACCESS" | grep --color -q "cidr:$FILE_POSTSCREEN" || $CMD_POSTCONF "postscreen_access_list=$LIST_ACCESS cidr:$FILE_POSTSCREEN"
-		if ! [ -f "$FILE_SCRIPT" ]
-		then
-			echo '#!/bin/bash' > $FILE_SCRIPT
-			if [[ "$OSTYPE" == "darwin*" ]]
-			then
-				which getspf >> $FILE_SCRIPT
-			else
-				typeset -f getspf >> $FILE_SCRIPT
-			fi
-			echo 'getspf $@' >> $FILE_SCRIPT
-			chmod +x $FILE_SCRIPT
-		fi
-		grep --color -q "^@daily root \"$FILE_SCRIPT -s -p\"" "$FILE_CRON" || echo "@daily root \"$FILE_SCRIPT -s -p\"" >> "$FILE_CRON"
-		[ "$SILENT" = 0 ] && echo "Added Postscreen SPF whitelist '$FILE_POSTSCREEN' to Postfix configuration and created daily update Cron job"
-	fi
+getspf() {
+    FILE_POSTSCREEN='/etc/postfix/maps/postscreen_spf_whitelist.cidr'
+    FILE_CRON='/etc/crontab'
+    FILE_SCRIPT='/root/getspf.sh'
+    DOMAIN_DEFAULT='microsoft.com google.com'
+    if [[ "$OSTYPE" =~ "darwin" ]]; then CMD_WHICH='which'; else CMD_WHICH='typeset -f'; fi
+    $CMD_WHICH e_error &>/dev/null && CMD_ECHO='e_error' || CMD_ECHO='echo'
+    if ! which ipcalc &>/dev/null; then
+        $CMD_ECHO "please install 'ipcalc'"
+        return 1
+    fi
+    if [[ "$OSTYPE" =~ "darwin" ]]; then
+        if ! which gawk &>/dev/null; then
+            $CMD_ECHO "please install 'gawk'"
+            return 1
+        fi
+        CMD_AWK="gawk"
+    else
+        CMD_AWK="awk"
+    fi
+    SILENT=0
+    POSTSCREEN=0
+    reg_exp() { # awk regexp
+        echo "$2" | "$CMD_AWK" "{pattern=\"$1\"; while (match(\$0, pattern, arr)) {val = arr[1]; print val; sub(pattern, \"\")}}"
+    }
+    spf_domain() {
+        LIST_IP=''
+        LIST_INCLUDE=''
+        COUNT_DIG=0
+        SPF_RECORD="$(dig +short +nodnssec TXT $1 | grep 'v=spf1' | sed 's/\" \"//g' | sed 's/\"//g' | awk '{for(i=1;i<=NF;i++){if ($i ~ /redirect=|ip4:|include:|a:/) {print $i}}}' | xargs)"
+        while true; do
+            LIST_IP+=" $(reg_exp 'ip4:([^ ]+)' "$SPF_RECORD" | xargs)"
+            LIST_IP+=" $(for DOMAIN_NAME in $(reg_exp 'a:([^ ]+)' "$SPF_RECORD" | xargs); do dig +short +nodnssec $DOMAIN_NAME; COUNT_DIG="$(expr $COUNT_DIG + 1)"; done)"
+            DOMAIN_ADD="$(reg_exp 'include:([^ ]+)' "$SPF_RECORD" | xargs)"
+            ! [ -z "$DOMAIN_ADD" ] && LIST_INCLUDE+=" $DOMAIN_ADD"
+            DOMAIN_ADD="$(reg_exp 'redirect=([^ ]+)' "$SPF_RECORD" | xargs)"
+            ! [ -z "$DOMAIN_ADD" ] && LIST_INCLUDE+=" $DOMAIN_ADD"
+            if [ -z "$LIST_INCLUDE" ]; then
+                break
+            else
+                SPF_RECORD="$(dig +short +nodnssec TXT $(echo $LIST_INCLUDE | awk '{print $1}') | grep 'v=spf1' | sed 's/\" \"//g' | sed 's/\"//g' | awk '{for(i=1;i<=NF;i++){if ($i ~ /redirect=|ip4:|include:|a:/) {print $i}}}' | xargs)"
+                COUNT_DIG="$(expr $COUNT_DIG + 1)"
+                LIST_INCLUDE="$(echo $LIST_INCLUDE | awk '{for(i=2;i<=NF;i++) {print $i}}' | xargs)" 
+            fi
+        done
+        MX_IP="$(for MX_ADDRESS in $(dig +short +nodnssec mx $1 | awk '{print $2}'); do dig +short +nodnssec A $MX_ADDRESS; done)"
+        ! [ -z "$MX_IP" ] && LIST_IP+=" $MX_IP"
+        LIST_IP="$(echo $LIST_IP | xargs -n 1 | sort -uV)"
+        LIST_IP_VALID=''
+        LIST_IP_INVALID=''
+        for IP_ADDRESS in $(echo $LIST_IP); do
+            if [ -z "$(echo $IP_ADDRESS | awk -F'.' 'NF==4 && $1>0 && $1<224 && $2>=0 && $2<256 && $3>=0 && $3<256 && $4>=0')" ]; then
+                LIST_IP_INVALID+=" $IP_ADDRESS"
+            else
+                LIST_IP_VALID+=" $IP_ADDRESS"
+            fi
+        done
+        LIST_CIDR_VALID=''
+        LIST_CIDR_INVALID=''
+        for IP_ADDRESS in $(echo $LIST_IP_VALID | xargs -n 1); do
+            if echo $IP_ADDRESS | grep -q -v '/' || echo "$IP_ADDRESS" | grep -q '/32'; then
+                LIST_CIDR_VALID+=" $IP_ADDRESS"
+            else
+                NETWORK=$(ipcalc "$IP_ADDRESS" | grep "^Network" | awk '{print $2}' | awk -F "/" '{print $1}')
+                IP_ADDR=$(ipcalc "$IP_ADDRESS" | grep "^Address" | awk '{print $2}')
+                [[ "$NETWORK" != "$IP_ADDR" ]] && LIST_CIDR_INVALID+=" $IP_ADDRESS" || LIST_CIDR_VALID+=" $IP_ADDRESS"
+            fi
+        done
+        if [ "$POSTSCREEN" = 1 ]; then
+            for IP_ADDRESS in $(echo $LIST_CIDR_VALID | xargs -n 1); do
+                if [ "$SILENT" = 0 ]; then
+                    echo "$IP_ADDRESS permit" >> $FILE_POSTSCREEN
+                else
+                    echo "$IP_ADDRESS permit"
+                fi
+            done
+            [ "$SILENT" = 0 ] && echo "IPv4 addresses/domains added to Postscreen SPF whitelist '$FILE_POSTSCREEN'"
+        else
+            echo "$LIST_CIDR_VALID" | xargs -n 1
+        fi
+        if [ "$SILENT" = 0 ]; then
+            echo ''
+            if ! [ -z "$LIST_IP_INVALID" ]; then
+                for IP_ADDRESS in $(echo $LIST_IP_INVALID | xargs -n 1); do
+                    $CMD_ECHO "$IP_ADDRESS is not a valid IPv4 address (maybe CNAME?)"
+                done
+            fi
+            if ! [ -z "$LIST_CIDR_INVALID" ]; then
+                for IP_ADDRESS in $(echo $LIST_CIDR_INVALID | xargs -n 1); do
+                    $CMD_ECHO "IPv4 network $IP_ADDRESS should be $(ipcalc $IP_ADDRESS| grep "^Network:" | awk '{ print $2 }')"
+                done
+            fi
+            echo "IPv4 addresses/networks: $(echo $LIST_IP | wc -w)"
+            echo "DNS lookups: $COUNT_DIG"
+            [ "$COUNT_DIG" -gt 10 ] && $CMD_ECHO "DNS lookups >10, SPF entry is invalid (RFC 4408)"
+        fi
+    }
+    ARG_QUERY=''
+    ERROR_INPUT=0
+    INSTALL=0
+    for ARG in $@; do
+        if [ "$ARG" = '-s' ] || [ "$ARG" = '--silent' ]; then
+            SILENT=1
+        elif [ "$ARG" = '-p' ] || [ "$ARG" = '--postscreen' ]; then
+            POSTSCREEN=1
+        elif [ "$ARG" = '-i' ] || [ "$ARG" = '--install' ]; then
+            INSTALL=1
+        elif [ "$ARG" = '-h' ] || [ "$ARG" = '-?' ] || [ "$ARG" = '--help' ]; then
+            echo "Usage: $(basename $0) [-s/--slient] [-p/--postscreen] [-i/--install] [-h/-?/--help] domain_name/file_with_domain_names"
+            return 0
+        else
+            [ -z "$ARG_QUERY" ] && ARG_QUERY="$ARG" || ERROR_INPUT=1
+        fi
+    done
+    if [ "$ERROR_INPUT" = 1 ]; then
+        echo "Usage: $(basename $0) [-s/--slient] [-p/--postscreen] [-i/--install] [-h/-?/--help] domain_name/file_with_domain_names"
+        return 1
+    fi
+    if [ "$POSTSCREEN" = 1 ]; then
+        mkdir -p "$(dirname $FILE_POSTSCREEN)"
+    fi
+    if [ -z "$ARG_QUERY" ]; then
+        DOMAIN_QUERY="$DOMAIN_DEFAULT"
+    elif [ -f "$ARG_QUERY" ]; then
+        DOMAIN_QUERY="$(cat "$ARG_QUERY")"
+    else
+        DOMAIN_QUERY="$ARG_QUERY"
+    fi
+    if [ "$SILENT" = 0 ]; then
+        for DOMAIN in $(echo $DOMAIN_QUERY | xargs -n 1); do
+            echo "Domain: $DOMAIN"$'\n'
+            spf_domain "$DOMAIN"
+            echo "==================================================="
+        done
+        if [ "$POSTSCREEN" = 1 ]; then
+            LIST_RESULT="$(cat $FILE_POSTSCREEN)"
+            echo "$LIST_RESULT" | xargs -n 2 | sort -uV > $FILE_POSTSCREEN
+            echo "IPv4 addresses/domains added to Postscreen SPF whitelist '$FILE_POSTSCREEN'"
+        fi
+    else
+        LIST_RESULT="$(for DOMAIN in $(echo $DOMAIN_QUERY | xargs -n 1); do spf_domain "$DOMAIN"; done | sort -uV)"
+        if [ "$POSTSCREEN" = 1 ]; then
+            echo "$LIST_RESULT" | xargs -n 2 > $FILE_POSTSCREEN
+        else
+            echo "$LIST_RESULT" | xargs -n 1
+        fi
+    fi
+    if [ "$INSTALL" = 1 ]; then
+        POSTFIX_INBOUND="$(postmulti -l | grep '^postfix-in' | awk '{print $1}')"
+        [ -z "$POSTFIX_INBOUND" ] && CMD_POSTCONF='postconf' || CMD_POSTCONF="postmulti -i "$POSTFIX_INBOUND" -x postconf"
+        LIST_ACCESS="$($CMD_POSTCONF postscreen_access_list | awk -F ' = ' '{print $2}')"
+        echo "$LIST_ACCESS" | grep -q "cidr:$FILE_POSTSCREEN" || $CMD_POSTCONF "postscreen_access_list=$LIST_ACCESS cidr:$FILE_POSTSCREEN"
+        if ! [ -f "$FILE_SCRIPT" ]; then
+            echo '#!/bin/bash' > $FILE_SCRIPT
+            if [[ "$OSTYPE" == "darwin*" ]]; then
+                which getspf >> $FILE_SCRIPT
+            else
+                typeset -f getspf >> $FILE_SCRIPT
+            fi
+            echo 'getspf $@' >> $FILE_SCRIPT
+            chmod +x $FILE_SCRIPT
+        fi
+        grep -q "^@daily root \"$FILE_SCRIPT -s -p\"" "$FILE_CRON" || echo "@daily root \"$FILE_SCRIPT -s -p\"" >> "$FILE_CRON"
+        [ "$SILENT" = 0 ] && echo "Added Postscreen SPF whitelist '$FILE_POSTSCREEN' to Postfix configuration and created daily update Cron job"
+    fi
 }
